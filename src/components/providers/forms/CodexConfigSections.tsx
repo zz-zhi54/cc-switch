@@ -11,9 +11,11 @@ import React, {
 import { useTranslation } from "react-i18next";
 import JsonEditor from "@/components/JsonEditor";
 import {
+  extractCodexModelName,
   isCodexGoalModeEnabled,
   isCodexRemoteCompactionEnabled,
   setCodexGoalMode,
+  setCodexMemoriesSection,
   setCodexRemoteCompaction,
 } from "@/utils/providerConfigUtils";
 /*
@@ -114,6 +116,10 @@ interface CodexConfigSectionProps {
   commonConfigError?: string;
   configError?: string;
   isProxyTakeover?: boolean;
+  /** 「启用 Codex 记忆功能」开关：开启时把 [memories] 段的两个
+   * 模型字段同步为顶层 model；关闭时移除整段。 */
+  memoriesEnabled?: boolean;
+  onMemoriesEnabledChange?: (enabled: boolean) => void;
 }
 
 /**
@@ -130,6 +136,8 @@ export const CodexConfigSection: React.FC<CodexConfigSectionProps> = ({
   commonConfigError,
   configError,
   isProxyTakeover = false,
+  memoriesEnabled = false,
+  onMemoriesEnabledChange,
 }) => {
   const { t } = useTranslation();
   const [isDarkMode, setIsDarkMode] = useState(false);
@@ -194,6 +202,21 @@ export const CodexConfigSection: React.FC<CodexConfigSectionProps> = ({
       );
     },
     [handleLocalChange, providerName],
+  );
+
+  const handleMemoriesToggle = useCallback(
+    (checked: boolean) => {
+      // 把当前 model 同步为 [memories] 段的两个模型字段。
+      // 顶层无 model 时 no-op（让用户先填 model 再开开关），
+      // 不去覆盖用户在 [memories] 段里已显式设置的值。
+      const current = localValueRef.current || "";
+      const model = extractCodexModelName(current) ?? "";
+      handleLocalChange(
+        setCodexMemoriesSection(current, checked, model, model),
+      );
+      onMemoriesEnabledChange?.(checked);
+    },
+    [handleLocalChange, onMemoriesEnabledChange],
   );
 
   // Codex 1M 上下文相关状态/回调暂时禁用——见同文件下方 JSX 注释处的恢复说明。
@@ -302,6 +325,16 @@ export const CodexConfigSection: React.FC<CodexConfigSectionProps> = ({
               {t("codexConfig.enableRemoteCompaction")}
             </label>
           )}
+
+          <label className="inline-flex cursor-pointer items-center gap-2 text-sm text-muted-foreground">
+            <input
+              type="checkbox"
+              checked={memoriesEnabled}
+              onChange={(e) => handleMemoriesToggle(e.target.checked)}
+              className="w-4 h-4 text-blue-500 bg-white dark:bg-gray-800 border-border-default rounded focus:ring-blue-500 dark:focus:ring-blue-400 focus:ring-2"
+            />
+            {t("codexConfig.enableMemories")}
+          </label>
 
           <label className="inline-flex cursor-pointer items-center gap-2 text-sm text-muted-foreground">
             <input

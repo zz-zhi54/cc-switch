@@ -939,6 +939,116 @@ fn set_codex_native_web_search_field(config_text: &str, disable: bool) -> Result
     Ok(doc.to_string())
 }
 
+/// Codex `[memories]` 段中两个模型字段的键名。
+///
+/// Codex 记忆/chronicle 后端使用这两个字段来选择用于记忆抽取和整合的
+/// 模型；若未配置则回退到顶层 `model`。在自定义供应商下，指向
+/// `MiniMax-M3` / `gpt-5.4-mini` 等 OpenAI 原生模型会导致后端找不到
+/// 模型而报错——cc-switch 用「启用 Codex 记忆功能」开关处理该场景。
+const CODEX_MEMORIES_EXTRACT_MODEL: &str = "extract_model";
+const CODEX_MEMORIES_CONSOLIDATION_MODEL: &str = "consolidation_model";
+const CODEX_MEMORIES_TABLE: &str = "memories";
+
+/// 从 Codex `config.toml` 文本中读取 `[memories]` 段的 `extract_model` 与
+/// `consolidation_model`。
+///
+/// - `[memories]` 段不存在 → `None`
+/// - 段存在但某字段缺失或为空字符串 → 该位置返回 `None`
+/// - 都为非空字符串 → 返回 `Some((Some(extract), Some(consolidation)))`
+pub fn extract_codex_memories_models(
+    config_text: &str,
+) -> Option<(Option<String>, Option<String>)> {
+    if config_text.trim().is_empty() || !config_text.contains(CODEX_MEMORIES_TABLE) {
+        return None;
+    }
+    let doc = config_text.parse::<DocumentMut>().ok()?;
+    let memories = doc.get(CODEX_MEMORIES_TABLE)?.as_table()?;
+
+    let extract = memories
+        .get(CODEX_MEMORIES_EXTRACT_MODEL)
+        .and_then(|item| item.as_str())
+        .map(str::trim)
+        .filter(|value| !value.is_empty())
+        .map(str::to_string);
+    let consolidation = memories
+        .get(CODEX_MEMORIES_CONSOLIDATION_MODEL)
+        .and_then(|item| item.as_str())
+        .map(str::trim)
+        .filter(|value| !value.is_empty())
+        .map(str::to_string);
+
+    Some((extract, consolidation))
+}
+
+/// 切换 Codex `config.toml` 的 `[memories]` 段中两个模型字段：
+///
+/// - `enabled = false`：移除整个 `[memories]` 表（无则 no-op）
+/// - `enabled = true`：确保 `[memories]` 表存在并把 `extract_model` /
+///   `consolidation_model` 写为指定值（覆盖已有值）；其他
+///   `[memories]` 字段（`generate_memories` / `use_memories` /
+///   `disable_on_external_context` / `min_rate_limit_remaining_percent`）
+///   原样保留。
+///
+/// 使用 `toml_edit::DocumentMut` 保持原有语法风格与注释；当输入未变
+/// （两个 key 都不存在，或值都等于现状）时直接返回原文，避免无谓的
+/// mtime 变化。
+pub fn set_codex_memories_models(
+    config_text: &str,
+    enabled: bool,
+    extract_model: &str,
+    consolidation_model: &str,
+) -> Result<String, AppError> {
+    let mut doc = config_text
+        .parse::<DocumentMut>()
+        .map_err(|e| AppError::Message(format!("Invalid Codex config.toml: {e}")))?;
+
+    if !enabled {
+        if doc.get(CODEX_MEMORIES_TABLE).is_none() {
+            return Ok(config_text.to_string());
+        }
+        doc.as_table_mut().remove(CODEX_MEMORIES_TABLE);
+        return Ok(doc.to_string());
+    }
+
+    let extract_trimmed = extract_model.trim();
+    let consolidation_trimmed = consolidation_model.trim();
+
+    // 防御：开启状态下若两个目标值都为空（用户尚未设置顶层 model），
+    // 保留 [memories] 段现有内容，不去覆盖用户显式设置的值。
+    if extract_trimmed.is_empty() && consolidation_trimmed.is_empty() {
+        return Ok(config_text.to_string());
+    }
+
+    // 短路：现状已与目标一致时直接返回原文，避免无谓的 mtime 变化。
+    if let Some((current_extract, current_consolidation)) =
+        extract_codex_memories_models(&doc.to_string())
+    {
+        let unchanged = current_extract.as_deref() == Some(extract_trimmed)
+            && current_consolidation.as_deref() == Some(consolidation_trimmed);
+        if unchanged && doc.get(CODEX_MEMORIES_TABLE).is_some() {
+            return Ok(config_text.to_string());
+        }
+    }
+
+    if doc.get(CODEX_MEMORIES_TABLE).is_none() {
+        doc[CODEX_MEMORIES_TABLE] = toml_edit::table();
+    }
+    if let Some(memories) = doc[CODEX_MEMORIES_TABLE].as_table_mut() {
+        if extract_trimmed.is_empty() {
+            memories.remove(CODEX_MEMORIES_EXTRACT_MODEL);
+        } else {
+            memories[CODEX_MEMORIES_EXTRACT_MODEL] = toml_edit::value(extract_trimmed);
+        }
+        if consolidation_trimmed.is_empty() {
+            memories.remove(CODEX_MEMORIES_CONSOLIDATION_MODEL);
+        } else {
+            memories[CODEX_MEMORIES_CONSOLIDATION_MODEL] = toml_edit::value(consolidation_trimmed);
+        }
+    }
+
+    Ok(doc.to_string())
+}
+
 /// Generate Codex `model_catalog_json` from provider settings and inject/remove
 /// the top-level TOML field that points Codex to the generated file.
 pub fn prepare_codex_config_text_with_model_catalog(
@@ -2981,5 +3091,199 @@ model_catalog_json = "cc-switch-model-catalog.json"
             parsed.get("model_catalog_json").is_none(),
             "None arm should remove relative cc-switch-owned field"
         );
+    }
+
+    // ----------------------- [memories] 段处理 -----------------------
+    //
+    // Codex 的 `[memories]` 段在用户显式启用 cc-switch 的「启用 Codex 记忆
+    // 功能」开关时由前端调用 `set_codex_memories_models` 写入；这两个键
+    // 覆盖用户已显式设置的值，但保留其他 `[memories]` 字段（生成开关、
+    // 速率阈值等）。本组测试覆盖核心开关语义。
+
+    #[test]
+    fn extract_memories_models_returns_none_when_table_absent() {
+        let parsed = extract_codex_memories_models(r#"model = "deepseek-v4-pro""#);
+        assert!(parsed.is_none(), "无 [memories] 段时应返回 None");
+    }
+
+    #[test]
+    fn extract_memories_models_returns_none_fields_for_empty_values() {
+        let parsed = extract_codex_memories_models(
+            r#"[memories]
+extract_model = ""
+consolidation_model = ""
+generate_memories = true
+"#,
+        )
+        .expect("[memories] 段应被识别");
+        assert!(parsed.0.is_none(), "空字符串 extract_model 应归一为 None");
+        assert!(
+            parsed.1.is_none(),
+            "空字符串 consolidation_model 应归一为 None"
+        );
+    }
+
+    #[test]
+    fn extract_memories_models_returns_trimmed_values() {
+        let parsed = extract_codex_memories_models(
+            r#"[memories]
+extract_model = "  MiniMax-M3  "
+consolidation_model = "gpt-5.4-mini"
+"#,
+        )
+        .expect("[memories] 段应被识别");
+        assert_eq!(parsed.0.as_deref(), Some("MiniMax-M3"));
+        assert_eq!(parsed.1.as_deref(), Some("gpt-5.4-mini"));
+    }
+
+    #[test]
+    fn set_memories_models_disabled_removes_table() {
+        let input = r#"[memories]
+extract_model = "MiniMax-M3"
+consolidation_model = "gpt-5.4-mini"
+generate_memories = true
+"#;
+        let result = set_codex_memories_models(input, false, "", "").unwrap();
+        let parsed: toml::Value = toml::from_str(&result).unwrap();
+        assert!(
+            parsed.get("memories").is_none(),
+            "enabled=false 应整体移除 [memories] 表"
+        );
+    }
+
+    #[test]
+    fn set_memories_models_disabled_is_noop_when_absent() {
+        let input = r#"model = "deepseek-v4-pro""#;
+        let result = set_codex_memories_models(input, false, "", "").unwrap();
+        assert_eq!(result, input, "[memories] 段不存在时 disabled 应原样返回");
+    }
+
+    #[test]
+    fn set_memories_models_enabled_writes_table_and_preserves_other_keys() {
+        let input = r#"model = "deepseek-v4-pro"
+
+[memories]
+generate_memories = true
+use_memories = false
+disable_on_external_context = true
+min_rate_limit_remaining_percent = 50
+extract_model = "MiniMax-M3"
+"#;
+        let result =
+            set_codex_memories_models(input, true, "deepseek-v4-pro", "deepseek-v4-pro").unwrap();
+        let parsed: toml::Value = toml::from_str(&result).unwrap();
+        let memories = parsed.get("memories").expect("应存在 [memories] 段");
+        assert_eq!(
+            memories.get("extract_model").and_then(|v| v.as_str()),
+            Some("deepseek-v4-pro")
+        );
+        assert_eq!(
+            memories.get("consolidation_model").and_then(|v| v.as_str()),
+            Some("deepseek-v4-pro")
+        );
+        // 其他用户字段必须原样保留。
+        assert_eq!(
+            memories.get("generate_memories").and_then(|v| v.as_bool()),
+            Some(true)
+        );
+        assert_eq!(
+            memories.get("use_memories").and_then(|v| v.as_bool()),
+            Some(false)
+        );
+        assert_eq!(
+            memories
+                .get("disable_on_external_context")
+                .and_then(|v| v.as_bool()),
+            Some(true)
+        );
+        assert_eq!(
+            memories
+                .get("min_rate_limit_remaining_percent")
+                .and_then(|v| v.as_integer()),
+            Some(50)
+        );
+    }
+
+    #[test]
+    fn set_memories_models_enabled_creates_table_when_absent() {
+        let input = r#"model = "claude-3-5-sonnet""#;
+        let result =
+            set_codex_memories_models(input, true, "claude-3-5-sonnet", "claude-3-5-sonnet")
+                .unwrap();
+        let parsed: toml::Value = toml::from_str(&result).unwrap();
+        let memories = parsed.get("memories").expect("应新建 [memories] 段");
+        assert_eq!(
+            memories.get("extract_model").and_then(|v| v.as_str()),
+            Some("claude-3-5-sonnet")
+        );
+        assert_eq!(
+            memories.get("consolidation_model").and_then(|v| v.as_str()),
+            Some("claude-3-5-sonnet")
+        );
+    }
+
+    #[test]
+    fn set_memories_models_overrides_existing_model_values() {
+        let input = r#"[memories]
+extract_model = "MiniMax-M3"
+consolidation_model = "gpt-5.4-mini"
+generate_memories = true
+"#;
+        let result =
+            set_codex_memories_models(input, true, "deepseek-v4-pro", "deepseek-v4-pro").unwrap();
+        let parsed: toml::Value = toml::from_str(&result).unwrap();
+        let memories = parsed.get("memories").expect("应保留 [memories] 段");
+        assert_eq!(
+            memories.get("extract_model").and_then(|v| v.as_str()),
+            Some("deepseek-v4-pro")
+        );
+        assert_eq!(
+            memories.get("consolidation_model").and_then(|v| v.as_str()),
+            Some("deepseek-v4-pro")
+        );
+        assert_eq!(
+            memories.get("generate_memories").and_then(|v| v.as_bool()),
+            Some(true),
+            "用户字段必须保留"
+        );
+    }
+
+    #[test]
+    fn set_memories_models_noop_when_values_unchanged() {
+        let input = r#"[memories]
+extract_model = "deepseek-v4-pro"
+consolidation_model = "deepseek-v4-pro"
+"#;
+        let result =
+            set_codex_memories_models(input, true, "deepseek-v4-pro", "deepseek-v4-pro").unwrap();
+        assert_eq!(result, input, "值未变时必须原样返回，避免 mtime 抖动");
+    }
+
+    #[test]
+    fn set_memories_models_enabled_with_empty_model_preserves_existing_values() {
+        // 用户开启开关但顶层无 model 时，绝不能覆盖 [memories] 已有值，
+        // 否则会破坏用户已显式配置的 extract_model / consolidation_model。
+        let input = r#"[memories]
+extract_model = "MiniMax-M3"
+consolidation_model = "gpt-5.4-mini"
+generate_memories = true
+"#;
+        let result = set_codex_memories_models(input, true, "", "").unwrap();
+        assert_eq!(
+            result, input,
+            "无 model 时启用开关必须保留原值，不能用空串覆盖"
+        );
+    }
+
+    #[test]
+    fn set_memories_models_enabled_with_empty_model_preserves_only_user_keys() {
+        // 即使 [memories] 段只有用户字段（无 model 字段），
+        // 开启开关 + 空 model 也必须 no-op，不能新增空字段。
+        let input = r#"[memories]
+generate_memories = true
+use_memories = false
+"#;
+        let result = set_codex_memories_models(input, true, "", "").unwrap();
+        assert_eq!(result, input, "无 model 时不能修改 [memories] 段");
     }
 }

@@ -2,7 +2,10 @@ import { useState, useCallback, useEffect, useRef } from "react";
 import {
   extractCodexBaseUrl,
   extractCodexExperimentalBearerToken,
+  extractCodexMemoriesModels,
+  extractCodexModelName,
   setCodexBaseUrl as setCodexBaseUrlInConfig,
+  setCodexMemoriesSection,
   updateCodexExperimentalBearerToken,
 } from "@/utils/providerConfigUtils";
 import { normalizeTomlText } from "@/utils/textNormalization";
@@ -40,6 +43,7 @@ export function useCodexConfigState({ initialData }: UseCodexConfigStateProps) {
     CodexCatalogModel[]
   >([]);
   const [codexAuthError, setCodexAuthError] = useState("");
+  const [memoriesEnabled, setMemoriesEnabled] = useState(false);
 
   const isUpdatingCodexBaseUrlRef = useRef(false);
 
@@ -133,6 +137,12 @@ export function useCodexConfigState({ initialData }: UseCodexConfigStateProps) {
     setCodexBaseUrl((prev) => (prev === extracted ? prev : extracted));
   }, [codexConfig]);
 
+  // 与 TOML 配置保持 [memories] 段开关同步：段存在即视为启用
+  useEffect(() => {
+    const sectionPresent = extractCodexMemoriesModels(codexConfig) !== null;
+    setMemoriesEnabled((prev) => (prev === sectionPresent ? prev : sectionPresent));
+  }, [codexConfig]);
+
   // 获取 API Key（从 auth JSON）
   const getCodexAuthApiKey = useCallback((authString: string): string => {
     try {
@@ -188,6 +198,21 @@ export function useCodexConfigState({ initialData }: UseCodexConfigStateProps) {
       );
     },
     [],
+  );
+
+  // 切换「启用 Codex 记忆功能」开关：
+  // - 关闭 → 移除整个 [memories] 段
+  // - 开启 → 写入 [memories] 段，extract_model / consolidation_model
+  //          都从当前顶层 model 取值（与「模型映射」保持一致）
+  const handleMemoriesEnabledChange = useCallback(
+    (enabled: boolean) => {
+      setMemoriesEnabled(enabled);
+      setCodexConfig((prev) => {
+        const model = extractCodexModelName(prev) ?? "";
+        return setCodexMemoriesSection(prev, enabled, model, model);
+      });
+    },
+    [setCodexConfig],
   );
 
   // 处理 Codex API Key 输入并写回 auth.json
@@ -259,6 +284,9 @@ export function useCodexConfigState({ initialData }: UseCodexConfigStateProps) {
       setCodexBaseUrl(baseUrl || "");
 
       setCodexApiKey(pickCodexApiKey(auth, config));
+
+      const sectionPresent = extractCodexMemoriesModels(config) !== null;
+      setMemoriesEnabled(sectionPresent);
     },
     [setCodexAuth, setCodexConfig, setCodexCatalogModels],
   );
@@ -270,12 +298,14 @@ export function useCodexConfigState({ initialData }: UseCodexConfigStateProps) {
     codexBaseUrl,
     codexCatalogModels,
     codexAuthError,
+    memoriesEnabled,
     setCodexAuth,
     setCodexConfig,
     setCodexCatalogModels,
     handleCodexApiKeyChange,
     handleCodexBaseUrlChange,
     handleCodexConfigChange,
+    handleMemoriesEnabledChange,
     resetCodexConfig,
     getCodexAuthApiKey,
     validateCodexAuth,

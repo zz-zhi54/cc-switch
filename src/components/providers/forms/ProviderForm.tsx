@@ -573,12 +573,14 @@ function ProviderFormFull({
     codexBaseUrl,
     codexCatalogModels,
     codexAuthError,
+    memoriesEnabled,
     setCodexAuth,
     setCodexConfig,
     setCodexCatalogModels,
     handleCodexApiKeyChange,
     handleCodexBaseUrlChange,
     handleCodexConfigChange: originalHandleCodexConfigChange,
+    handleMemoriesEnabledChange,
     resetCodexConfig,
   } = useCodexConfigState({ initialData });
 
@@ -2292,6 +2294,8 @@ function ProviderFormFull({
                 configError={codexConfigError}
                 onExtract={handleCodexExtract}
                 isExtracting={isCodexExtracting}
+                memoriesEnabled={memoriesEnabled}
+                onMemoriesEnabledChange={handleMemoriesEnabledChange}
               />
               {settingsConfigErrorField}
             </>
